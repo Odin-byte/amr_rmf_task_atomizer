@@ -16,8 +16,8 @@ from amr_rmf_task_atomizer.ItemObject import ItemObject
 from amr_rmf_task_atomizer.TaskObject import TaskObject, TaskType
 from rmf_fleet_msgs.msg import FleetState
 from rmf_task_msgs.msg import ApiResponse
-from amr_rmf_task_atomizer_msgs.msg import TaskState, TaskOverview
-from amr_rmf_task_atomizer_msgs.srv import TaskRequest
+from amr_rmf_task_atomizer_msgs.msg import TaskState
+from amr_rmf_task_atomizer_msgs.srv import ItemDispatchRequest, ItemStatusRequest
 
 
 class AmrTaskAtomizer(Node):
@@ -37,20 +37,16 @@ class AmrTaskAtomizer(Node):
 
         self.available_stations = {}
         self.available_robots = {}
-        self.current_tasks = deque(maxlen=15)
 
         # Service allowing for the dispatch of tasks
         self.atomic_task_request_service = self.create_service(
-            TaskRequest, "amr_atomic_tasks_request", self.atomic_task_request_cb
+            ItemDispatchRequest, "atomic_task_item_dispatch", self.atomic_item_dispatch_cb
         )
 
         # Service to provide feedback on the state of the current transport items / task
         self.task_state_service = self.create_service(
-            TaskState, "amr_atomic_tasks_status_request", self.task_state_request_cb
+            ItemStatusRequest, "atomic_task_item_status", self.atomic_item_status_cb
         )
-
-        # Feedback publisher for the current tasks
-        self.task_state_pub = self.create_publisher(TaskOverview, "amr_current_tasks", 10)
 
         self.create_subscription(FleetState, "fleet_states", self.fleet_state_cb, 10)
 
@@ -78,6 +74,19 @@ class AmrTaskAtomizer(Node):
             ),
         )
 
+        self.declare_parameter(
+            "task_history_length",
+            15,
+            ParameterDescriptor(
+                description="How many tasks to keep in the history"
+            ),
+        )
+
+        self.get_logger().info("Task Atomizer Node started")
+
+        task_history_length = self.get_parameter("task_history_length").get_parameter_value().integer_value
+        self.current_tasks = deque(maxlen=task_history_length)
+
         config_path = (
             self.get_parameter("config_path").get_parameter_value().string_value
         )
@@ -99,11 +108,11 @@ class AmrTaskAtomizer(Node):
             self.get_parameter("combine_jobs").get_parameter_value().bool_value
         )
     
-    def atomic_task_request_cb(self, request, response):
+    def atomic_item_dispatch_cb(self, request, response):
         self.get_logger().info("Got called")
 
         # Add a transport pair to the given stations
-        pair_id = self.add_transport_pair(request.pickup_station, request.dropoff_station, request.item_name)
+        pair_id = self.add_transport_pair(request.pickup_station, request.dropoff_station)
 
         if pair_id == None:
             response.success = False
@@ -114,7 +123,48 @@ class AmrTaskAtomizer(Node):
         response.task_id = str(pair_id)
         return response
     
-    def task_state_request_cb(self, request, response):
+    def atomic_item_status_cb(self, request, response):
+        # Check if a task with the given item ID is currently active
+        for task in self.current_tasks:
+            if request.item_id in task.item_ids_pickup:
+                response.success = True
+                
+                # Get the position of the item in pickup and dropoff id lists
+                pickup_index = task.item_ids_pickup.index(request.item_id)
+                dropoff_index = task.item_ids_dropoff.index(request.item_id)
+
+                # Get the pickup position and dropoff position of the task
+                response.pickup_station = task.pick_up_places[pickup_index]
+                response.dropoff_station = task.drop_off_places[dropoff_index]
+
+                # Check if the item is already picked up or dropped off
+                if pickup_index < task.item_pick_up_count:
+                    response.pickup_done = True
+                else:
+                    response.pickup_done = False
+                
+                if dropoff_index < task.item_drop_off_count:
+                    response.dropoff_done = True
+                else:
+                    response.dropoff_done = False
+                
+                response.task_id = task.task_id
+                response.task_status = task.status
+                response.robot_id = task.robot_id
+                return response
+        # If no task was found check if the item is in the stations
+        for station_name, station_deque in self.available_stations.items():
+            for item in station_deque:
+                self.get_logger().info(f"Item ID: {item.pair_id} Request ID: {request.item_id}")
+                if item.pair_id == request.item_id and item.pick_up:
+                    response.success = True
+                    response.message = "Item is waiting to be dispatched as an atomic task"
+                    response.pickup_station = station_name
+                    return response
+        
+        response.success = False
+        response.message = "Item not found in any task or station"
+        return response
 
     def add_transport_pair(self, station_pickup, station_dropoff)->uuid.UUID:
         
@@ -124,6 +174,7 @@ class AmrTaskAtomizer(Node):
 
         # Generate a uuid
         pair_id = uuid.uuid4()
+        self.get_logger().info(f"Generated pair ID: {pair_id}")
 
         # Create two ItemObjects with the same id
         pickup_obj = ItemObject(pair_id, is_pickup=True)
@@ -172,23 +223,46 @@ class AmrTaskAtomizer(Node):
                     not second_item.processed
                     and first_item.pair_id == second_item.pair_id
                 ):
-                    # Mark both items as processed
-                    first_item.processed = True
-                    second_item.processed = True
+                    # Ensure the first and second items are not marked as processed beforehand
+                    if first_item.processed or second_item.processed:
+                        continue
 
                     pickup_station, dropoff_station = self._identify_stations(first_item, station_name, second_item, other_station_name)
 
                     if self.combine_jobs:
                         self.get_logger().info("Checking for combinations")
                         pickup_stations, dropoff_stations = self._check_for_task_combination(pickup_station, dropoff_station)
-                    
+                        # Collect all pair IDs for the combined task
+                        item_ids_pickup = []
+                        item_ids_dropoff = []
+                        for station in pickup_stations:
+                            for item in self.available_stations[station]:
+                                if not item.processed:
+                                    item_ids_pickup.append(str(item.pair_id))
+                                    item.processed = True
+                                    break
+                        for station in dropoff_stations:
+                            for item in self.available_stations[station]:
+                                if not item.processed:
+                                    item_ids_dropoff.append(str(item.pair_id))
+                                    item.processed = True
+                                    break
                     else:
                         pickup_stations = [pickup_station]
                         dropoff_stations = [dropoff_station]
-
+                        item_ids_pickup = [str(self.available_stations[pickup_station][0].pair_id)]
+                        item_ids_dropoff = [str(self.available_stations[dropoff_station][0].pair_id)]
+                        first_item.processed = True
+                        second_item.processed = True
                     # Create a task with the paired items
-                    self.create_task(pickup_stations, dropoff_stations)
-                    break
+                    self.get_logger().info(f"Creating task with item ids {item_ids_pickup} and {item_ids_dropoff}")
+                    self.create_task(pickup_stations, dropoff_stations, item_ids_pickup, item_ids_dropoff)
+
+                    # Mark both items as processed after creating the task
+                    first_item.processed = True
+                    second_item.processed = True
+
+                    return  # Return after creating the task
 
     def _identify_stations(self, first_item: ItemObject, station_name: str, second_item: ItemObject, other_station_name: str):
         if first_item.pick_up == True and second_item.pick_up == False:
@@ -224,8 +298,6 @@ class AmrTaskAtomizer(Node):
         if upcoming_item_pickup != None and upcoming_item_dropoff != None and upcoming_item_pickup.pair_id == upcoming_item_dropoff.pair_id:
                 self.get_logger().info("Got underlaying pair!")
                 second_pickup, second_dropoff = self._identify_stations(upcoming_item_pickup, pickup_station, upcoming_item_dropoff, dropoff_station)
-                upcoming_item_pickup.processed = True
-                upcoming_item_dropoff.processed = True
                 return[pickup_station, second_pickup], [dropoff_station, second_dropoff]
 
         # Check if the underlaying items build a new pair with the remaining stations
@@ -239,18 +311,17 @@ class AmrTaskAtomizer(Node):
                 continue
             
             self.get_logger().info("Checking dropoff item")
+            # If the item is upcoming item in the dropoff station is another dropoff we can combine the current item with the upcoming dropoff to create a dual dropoff task
+            # If the upcomming item is a pickup we can combine the current item with the upcoming pickup to extend the chain
             if upcoming_item_dropoff != None and first_item.pair_id == upcoming_item_dropoff.pair_id:
                 second_pickup, second_dropoff = self._identify_stations(first_item, station_name, upcoming_item_dropoff, dropoff_station)
-                first_item.processed = True
-                upcoming_item_dropoff.processed = True
                 self.get_logger().info(f"Found combination with Pickup Stations {[pickup_station, second_pickup]} and Dropoff Stations {[dropoff_station, second_dropoff]}")
                 return [pickup_station, second_pickup], [dropoff_station, second_dropoff]
             
             self.get_logger().info("Checking pickup item")
-            if upcoming_item_pickup != None and upcoming_item_pickup.pick_up == True and first_item.pair_id == upcoming_item_pickup.pair_id:
+            # Because our stations are FIFO we can only combine the upcoming item on the pickup station if it is a another pickup
+            if upcoming_item_pickup != None and first_item.pair_id == upcoming_item_pickup.pair_id and upcoming_item_pickup.pick_up == True :
                 second_pickup, second_dropoff = self._identify_stations(first_item, station_name, upcoming_item_pickup, pickup_station)
-                first_item.processed = True
-                upcoming_item_pickup.processed = True
                 self.get_logger().info(f"Found combination with Pickup Stations {[pickup_station, second_pickup]} and Dropoff Stations {[dropoff_station, second_dropoff]}")
                 return [pickup_station, second_pickup], [dropoff_station, second_dropoff]
             else:
@@ -269,10 +340,11 @@ class AmrTaskAtomizer(Node):
         for task in self.current_tasks:
             if task.task_id == msg.name:
                 # Update station representations based on the state of the task
-                self.update_stations(task, msg)
+                self.update_task_and_stations(task, msg)
 
-    def update_stations(self, task: TaskObject, msg: TaskState):
+    def update_task_and_stations(self, task: TaskObject, msg: TaskState):
         task.status = msg.status
+        task.robot_id = msg.robot_id
 
         # Check if new pickups or dropoffs happened
         pickup_station_to_pop, items_picked_up, dropoff_station_to_pop, items_dropped_off = task.get_stations_to_clear(msg.pickups_done, msg.dropoffs_done)
@@ -285,26 +357,11 @@ class AmrTaskAtomizer(Node):
         if dropoff_station_to_pop != None:
             for i in range(0, items_dropped_off):
                 self.available_stations[dropoff_station_to_pop].popleft()
-                self.get_logger().info("Popped item")
-
-        # items = len(self.available_stations["Station_North"])
-        # self.get_logger().info(f"There are {items} in the deque")
-        # items = len(self.available_stations["Station_East"])
-        # self.get_logger().info(f"There are {items} in the deque")
-        # items = len(self.available_stations["Station_South"])
-        # self.get_logger().info(f"There are {items} in the deque")
-        # self.get_logger().info(f"Current task status {task.status}")
-
-
-    def _publish_current_tasks(self):
-        for task in self.current_tasks:
-            return
-
-        
+                self.get_logger().info("Popped item")      
 
     ### RMF Task Msg generation
 
-    def create_task(self, pickup_stations, dropoff_stations, pair_ids):
+    def create_task(self, pickup_stations, dropoff_stations, item_ids_pickup, item_ids_dropoff):
         # Create sets from the incoming lists
         pickup_set = set(pickup_stations)
         dropoff_set = set(dropoff_stations)
@@ -312,17 +369,17 @@ class AmrTaskAtomizer(Node):
         if len(dropoff_set) < len(dropoff_stations):
             if len(pickup_set) < len(pickup_stations):
                 self.get_logger().info("Creating 1 to 1 Delivery with 2 Items")
-                task = TaskObject(TaskType.PICKUP_TWO_SAME_DROPOFF, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, pair_ids=pair_ids)
+                task = TaskObject(TaskType.PICKUP_TWO_SAME_DROPOFF, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
             else:
                 self.get_logger().info(f"Creating n to 1 Delivery with Pickups {pickup_stations} and Dropoffs {dropoff_stations}")
-                task = TaskObject(TaskType.DELIVERY_SINGLE_DROPOFF, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, pair_ids=pair_ids)
+                task = TaskObject(TaskType.DELIVERY_SINGLE_DROPOFF, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
         else:
             if len(pickup_set) < len(pickup_stations):
                 self.get_logger().info("Creating 1 to 2 Delivery with 2 Items")
-                task = TaskObject(TaskType.PICKUP_TWO_DIFFERENT_DROPOFFS, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, pair_ids=pair_ids)
+                task = TaskObject(TaskType.PICKUP_TWO_DIFFERENT_DROPOFFS, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
             else:
                 self.get_logger().info(f"Creating (Chain) Delivery with Pickups {pickup_stations} and Dropoffs {dropoff_stations}")
-                task = TaskObject(TaskType.DELIVERY_CHAINED, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, pair_ids=pair_ids)
+                task = TaskObject(TaskType.DELIVERY_CHAINED, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
 
         # Dispatch the task
         self.dispatched_request_id = task.uuid
@@ -361,15 +418,7 @@ class AmrTaskAtomizer(Node):
 
     def debug_function(self):
         self.get_logger().info("Debugging")
-        print("Hallo Welt")
-        self.add_transport_pair("Station_North", "Station_East")
-        self.add_transport_pair("Station_North", "Station_South")
-        self.add_transport_pair("Station_West_North", "Station_North")
-        self.add_transport_pair("Station_North", "Station_South")
-        self.add_transport_pair("Station_West_North", "Station_East")
-        self.add_transport_pair("Station_North", "Station_South")
-        self.add_transport_pair("Station_West_South", "Station_North")
-        self.add_transport_pair("Station_South", "Station_East")
+        self.add_robot("Robot_1")
 
 
 def main():

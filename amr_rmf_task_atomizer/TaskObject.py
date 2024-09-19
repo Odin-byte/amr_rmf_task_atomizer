@@ -12,27 +12,35 @@ class TaskType(Enum):
 
 class TaskStatus(Enum):
     STATUS_QUEUED = 0
-    STATUS_ACTIVE=1
-    STATUS_WAITING=2
-    STATUS_DONE=3
-    STATUS_CANCELED=4
+    STATUS_ACTIVE = 1
+    STATUS_WAITING = 2
+    STATUS_DONE = 3
+    STATUS_CANCELED = 4
 
 class TaskObject:
-    def __init__(self, type: TaskType, pick_up_places: list[str], drop_off_places: list[str], ):
+    def __init__(self, type: TaskType, pick_up_places: list[str], drop_off_places: list[str], item_ids_pickup: list[uuid.UUID], item_ids_dropoff: list[uuid.UUID]):
         self.type = type
         self.status = None
 
         self.pick_up_places = pick_up_places
         self.drop_off_places = drop_off_places
+        
+        self.item_ids_pickup = item_ids_pickup
+        self.item_ids_dropoff = item_ids_dropoff
 
         self.pick_up_places_without_duplicates = list(dict.fromkeys(self.pick_up_places))
         self.drop_off_places_without_duplicates = list(dict.fromkeys(self.drop_off_places))
 
         self.pickups_done = 0
         self.dropoffs_done = 0
+
+        self.item_pick_up_count = 0
+        self.item_drop_off_count = 0
         
         self.uuid = str(uuid.uuid4())
         self.task_id = None
+
+        self.robot_id = None
 
     def get_stations_to_clear(self, pickups_done, dropoffs_done):
         pickup_station_to_clear = None
@@ -46,6 +54,7 @@ class TaskObject:
             pickup_station_to_clear = self.pick_up_places_without_duplicates[self.pickups_done - 1]
             # Count total occurrences of this station in the pickup list
             pickup_count = self.pick_up_places.count(pickup_station_to_clear)
+            self.item_pick_up_count += pickup_count
 
         # Check if a dropoff happened
         if self.dropoffs_done < dropoffs_done:
@@ -53,5 +62,6 @@ class TaskObject:
             dropoff_station_to_clear = self.drop_off_places_without_duplicates[self.dropoffs_done - 1]
             # Count total occurrences of this station in the drop-off list
             dropoff_count = self.drop_off_places.count(dropoff_station_to_clear)
+            self.item_drop_off_count += dropoff_count
 
         return pickup_station_to_clear, pickup_count, dropoff_station_to_clear, dropoff_count

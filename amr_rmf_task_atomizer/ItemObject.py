@@ -13,7 +13,7 @@ class ItemObject:
             pair_id (str): A unique uuid to mark the pair of items belonging to the same job
             is_pickup (bool): Indicates wether the item has to be picked up or is a placeholder for dropoff.
         """
-        self.pair_id = pair_id
+        self.pair_id = str(pair_id)
         self.pick_up = is_pickup
         self.processed = False
 

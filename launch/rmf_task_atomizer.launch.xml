@@ -1,0 +1,19 @@
+<?xml version='1.0' ?>
+
+<launch>
+
+  <!-- Atomic Task State Publisher -->
+  <node 
+  pkg="amr_rmf_task_atomizer" 
+  exec="amr_task_state_pub" 
+  output="screen" 
+  name="task_state_pub">
+  </node>
+
+  
+  <!-- Task Atomizer -->
+  <node pkg="amr_rmf_task_atomizer" exec="task_atomizer" output="screen" name="atomizer">
+    <param name="config_path" value="$(find-pkg-share amr_rmf_task_atomizer)/config/test_env.yaml"/>
+  </node>
+
+</launch>

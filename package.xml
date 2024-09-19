@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>amr_rmf_task_atomizer</name>
+  <version>1.0.1</version>
+  <description>Preprocessing of non atomic tasks for RMF</description>
+  <maintainer email="dominik.werman@4am-robotics.com">Dominik Werman</maintainer>
+  <license>Apache License 2.0</license>
+
+  <!-- <exec_depend>rmf_demos_maps</exec_depend> -->
+
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>amr_rmf_task_atomizer_msgs</exec_depend>
+  <!-- Also depends on websockets python but the rosdep version is not working -->
+  <exec_depend>launch_xml</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

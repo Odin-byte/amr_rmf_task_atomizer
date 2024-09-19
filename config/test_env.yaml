@@ -1,0 +1,9 @@
+name: Test Environment
+stations:
+  - Station_North
+  - Station_East
+  - Station_South
+  - Station_West_North
+  - Station_West_South
+fleets:
+  - Test_Fleet

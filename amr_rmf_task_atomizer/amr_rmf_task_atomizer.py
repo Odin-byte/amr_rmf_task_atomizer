@@ -17,7 +17,8 @@ from amr_rmf_task_atomizer.TaskObject import TaskObject, TaskType
 from rmf_fleet_msgs.msg import FleetState
 from rmf_task_msgs.msg import ApiResponse
 from amr_rmf_task_atomizer_msgs.msg import TaskState
-from amr_rmf_task_atomizer_msgs.srv import ItemDispatchRequest, ItemStatusRequest
+from amr_rmf_task_atomizer_msgs.srv import ItemDispatch, ItemStatus
+from std_msgs.msg import Int32
 
 
 class AmrTaskAtomizer(Node):
@@ -40,13 +41,16 @@ class AmrTaskAtomizer(Node):
 
         # Service allowing for the dispatch of tasks
         self.atomic_task_request_service = self.create_service(
-            ItemDispatchRequest, "atomic_task_item_dispatch", self.atomic_item_dispatch_cb
+            ItemDispatch, "atomic_task_item_dispatch", self.atomic_item_dispatch_cb
         )
 
         # Service to provide feedback on the state of the current transport items / task
         self.task_state_service = self.create_service(
-            ItemStatusRequest, "atomic_task_item_status", self.atomic_item_status_cb
+            ItemStatus, "atomic_task_item_status", self.atomic_item_status_cb
         )
+
+        # Create publisher for the number of current tasks / items
+        self.current_tasks_pub = self.create_publisher(Int32, "open_jobs", 10)
 
         self.create_subscription(FleetState, "fleet_states", self.fleet_state_cb, 10)
 
@@ -191,8 +195,7 @@ class AmrTaskAtomizer(Node):
         current_tasks = 0
         for _, station_deque in self.available_stations.items():
             current_tasks += len(station_deque)
-        self.get_logger().info(f"Current tasks in queue {current_tasks}")
-        # self.get_logger().info("Station Check")
+
         # Check if there are enough stations and robots available
         if len(self.available_stations) < 2 or len(self.available_robots) < 1:
             self.get_logger().info(
@@ -357,7 +360,21 @@ class AmrTaskAtomizer(Node):
         if dropoff_station_to_pop != None:
             for i in range(0, items_dropped_off):
                 self.available_stations[dropoff_station_to_pop].popleft()
-                self.get_logger().info("Popped item")      
+                self.get_logger().info("Popped item")
+
+    def _publish_current_tasks(self):
+        msg = Int32()
+        # Loop over all stations and count the items
+        current_items = 0
+        for _, station_deque in self.available_stations.items():
+            current_items += len(station_deque)
+        # The number of current tasks is the number of items in the stations divided by 2
+        current_tasks = current_items // 2
+        # If there is one item left in the stations we have a task that is not completed yet
+        if current_items % 2 != 0:
+            current_tasks += 1
+        msg.data = current_tasks
+        self.current_tasks_pub.publish(msg)   
 
     ### RMF Task Msg generation
 

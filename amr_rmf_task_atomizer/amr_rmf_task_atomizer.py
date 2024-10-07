@@ -13,7 +13,7 @@ from amr_rmf_task_atomizer.amr_task_dispatcher import AmrTaskDispatcher
 from amr_rmf_task_atomizer.RobotObject import RobotObject
 from amr_rmf_task_atomizer.StationObject import StationObject
 from amr_rmf_task_atomizer.ItemObject import ItemObject
-from amr_rmf_task_atomizer.TaskObject import TaskObject, TaskType
+from amr_rmf_task_atomizer.TaskObject import TaskObject, TaskType, TaskStatus
 from rmf_fleet_msgs.msg import FleetState
 from rmf_task_msgs.msg import ApiResponse
 from amr_rmf_task_atomizer_msgs.msg import TaskState
@@ -80,6 +80,13 @@ class AmrTaskAtomizer(Node):
         )
 
         self.declare_parameter(
+            "dynamic_combination",
+            False,
+            ParameterDescriptor(
+                description="Whether or not to chose to combine task if no open robots are available"
+            ),
+        )
+        self.declare_parameter(
             "task_history_length",
             15,
             ParameterDescriptor(
@@ -112,14 +119,25 @@ class AmrTaskAtomizer(Node):
         self.combine_jobs = (
             self.get_parameter("combine_jobs").get_parameter_value().bool_value
         )
+
+        self.dynamic_combination = (
+            self.get_parameter("dynamic_combination").get_parameter_value().bool_value
+        )
+
+        if self.combine_jobs:
+            self.get_logger().info("Combining N to 1 tasks will be dynamically checked")
     
     def atomic_item_dispatch_cb(self, request, response):
-        self.get_logger().info("Got called")
+
+        if request.pickup_station == request.dropoff_station:
+            response.success = False
+            response.message = "Pickup and Dropoff Station are the same!"
+            return response
 
         # Add a transport pair to the given stations
         pair_id = self.add_transport_pair(request.pickup_station, request.dropoff_station)
         self.dispatched_tasks += 1
-        self.get_logger().info(f"Added tasks number {self.dispatched_tasks}")
+        self.get_logger().debug(f"Added tasks number {self.dispatched_tasks}")
 
         if pair_id == None:
             response.success = False
@@ -162,7 +180,7 @@ class AmrTaskAtomizer(Node):
         # If no task was found check if the item is in the stations
         for station_name, station_deque in self.available_stations.items():
             for item in station_deque:
-                self.get_logger().info(f"Item ID: {item.pair_id} Request ID: {request.item_id}")
+                self.get_logger().debug(f"Item ID: {item.pair_id} Request ID: {request.item_id}")
                 if item.pair_id == request.item_id and item.pick_up:
                     response.success = True
                     response.message = "Item is waiting to be dispatched as an atomic task"
@@ -181,7 +199,7 @@ class AmrTaskAtomizer(Node):
 
         # Generate a uuid
         pair_id = uuid.uuid4()
-        self.get_logger().info(f"Generated pair ID: {pair_id}")
+        self.get_logger().debug(f"Generated pair ID: {pair_id}")
 
         # Create two ItemObjects with the same id
         pickup_obj = ItemObject(pair_id, is_pickup=True)
@@ -236,7 +254,7 @@ class AmrTaskAtomizer(Node):
                     pickup_station, dropoff_station = self._identify_stations(first_item, station_name, second_item, other_station_name)
 
                     if self.combine_jobs:
-                        self.get_logger().info("Checking for combinations")
+                        self.get_logger().debug("Checking for combinations")
                         pickup_stations, dropoff_stations = self._check_for_task_combination(pickup_station, dropoff_station)
                         # Collect all pair IDs for the combined task
                         item_ids_pickup = []
@@ -302,7 +320,7 @@ class AmrTaskAtomizer(Node):
         
         # Check if the underlaying items are a pair
         if upcoming_item_pickup != None and upcoming_item_dropoff != None and upcoming_item_pickup.pair_id == upcoming_item_dropoff.pair_id:
-                self.get_logger().info("Got underlaying pair!")
+                self.get_logger().debug("Got underlaying pair!")
                 second_pickup, second_dropoff = self._identify_stations(upcoming_item_pickup, pickup_station, upcoming_item_dropoff, dropoff_station)
                 return[pickup_station, second_pickup], [dropoff_station, second_dropoff]
 
@@ -316,29 +334,56 @@ class AmrTaskAtomizer(Node):
             if first_item.processed:
                 continue
             
-            self.get_logger().info("Checking dropoff item")
+            self.get_logger().debug("Checking dropoff item")
             # If the item is upcoming item in the dropoff station is another dropoff we can combine the current item with the upcoming dropoff to create a dual dropoff task
             # If the upcomming item is a pickup we can combine the current item with the upcoming pickup to extend the chain
             if upcoming_item_dropoff != None and first_item.pair_id == upcoming_item_dropoff.pair_id:
                 second_pickup, second_dropoff = self._identify_stations(first_item, station_name, upcoming_item_dropoff, dropoff_station)
-                self.get_logger().info(f"Found combination with Pickup Stations {[pickup_station, second_pickup]} and Dropoff Stations {[dropoff_station, second_dropoff]}")
+                self.get_logger().debug(f"Found combination with Pickup Stations {[pickup_station, second_pickup]} and Dropoff Stations {[dropoff_station, second_dropoff]}")
                 return [pickup_station, second_pickup], [dropoff_station, second_dropoff]
             
-            self.get_logger().info("Checking pickup item")
+            self.get_logger().debug("Checking pickup item")
             # Because our stations are FIFO we can only combine the upcoming item on the pickup station if it is a another pickup
-            if upcoming_item_pickup != None and first_item.pair_id == upcoming_item_pickup.pair_id and upcoming_item_pickup.pick_up == True :
+            # This pickup has to have another dropoff as an item pair with the same dropoff would have been catched by the unerlaying pair check
+            # A combination in this case would be benefical if there are no open robots to handle the second pair, which would be another atomic task otherwise
+
+            
+                    
+            if upcoming_item_pickup != None and first_item.pair_id == upcoming_item_pickup.pair_id and upcoming_item_pickup.pick_up == True:
+                # Check if the dynamic combination is enabled
+                if self.dynamic_combination:
+                    # Check if there are more robots available than current task which not have the status STATUS_DONE
+                    open_and_running_tasks = 0
+
+                    for task in self.current_tasks:
+                        if task.status is None or task.status != TaskStatus.STATUS_DONE or task.status != TaskStatus.STATUS_CANCELED:
+                            open_and_running_tasks += 1
+
+                    if len(self.available_robots) > open_and_running_tasks:
+                        self.get_logger().debug("Open robots available, not combining tasks")
+                        return [pickup_station], [dropoff_station]
+                        
+                # If dynamic combination is not enabled, always combine the tasks
                 second_pickup, second_dropoff = self._identify_stations(first_item, station_name, upcoming_item_pickup, pickup_station)
-                self.get_logger().info(f"Found combination with Pickup Stations {[pickup_station, second_pickup]} and Dropoff Stations {[dropoff_station, second_dropoff]}")
+                self.get_logger().debug(f"Found combination with Pickup Stations {[pickup_station, second_pickup]} and Dropoff Stations {[dropoff_station, second_dropoff]}")
                 return [pickup_station, second_pickup], [dropoff_station, second_dropoff]
             else:
-                self.get_logger().info("Got no combination")
+                self.get_logger().debug("Got no combination")
         return [pickup_station], [dropoff_station]
             
     def fleet_state_cb(self, msg):
+        # Add new robots
         for robot in msg.robots:
             if robot.name not in self.available_robots.keys():
                 self.get_logger().info(f"Added Robot with ID: {robot.name}")
                 self.add_robot(robot.name)
+
+        # Remove robots that are not in the message anymore
+        current_robot_names = {robot.name for robot in msg.robots}
+        for robot_name in list(self.available_robots.keys()):
+            if robot_name not in current_robot_names:
+                self.get_logger().info(f"Removed Robot with ID: {robot_name}")
+                del self.available_robots[robot_name]
         pass
 
     def atomic_tasks_update_cb(self, msg):
@@ -359,11 +404,11 @@ class AmrTaskAtomizer(Node):
         if pickup_station_to_pop != None:
             for i in range(0, items_picked_up):
                 self.available_stations[pickup_station_to_pop].popleft()
-                self.get_logger().info("Popped item")
+                self.get_logger().debug("Popped item")
         if dropoff_station_to_pop != None:
             for i in range(0, items_dropped_off):
                 self.available_stations[dropoff_station_to_pop].popleft()
-                self.get_logger().info("Popped item")
+                self.get_logger().debug("Popped item")
 
     def _publish_current_tasks(self):
         msg = Int32()
@@ -388,17 +433,17 @@ class AmrTaskAtomizer(Node):
 
         if len(dropoff_set) < len(dropoff_stations):
             if len(pickup_set) < len(pickup_stations):
-                self.get_logger().info("Creating 1 to 1 Delivery with 2 Items")
+                self.get_logger().debug("Creating 1 to 1 Delivery with 2 Items")
                 task = TaskObject(TaskType.PICKUP_TWO_SAME_DROPOFF, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
             else:
-                self.get_logger().info(f"Creating n to 1 Delivery with Pickups {pickup_stations} and Dropoffs {dropoff_stations}")
+                self.get_logger().debug(f"Creating n to 1 Delivery with Pickups {pickup_stations} and Dropoffs {dropoff_stations}")
                 task = TaskObject(TaskType.DELIVERY_SINGLE_DROPOFF, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
         else:
             if len(pickup_set) < len(pickup_stations):
-                self.get_logger().info("Creating 1 to 2 Delivery with 2 Items")
+                self.get_logger().debug("Creating 1 to 2 Delivery with 2 Items")
                 task = TaskObject(TaskType.PICKUP_TWO_DIFFERENT_DROPOFFS, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
             else:
-                self.get_logger().info(f"Creating (Chain) Delivery with Pickups {pickup_stations} and Dropoffs {dropoff_stations}")
+                self.get_logger().debug(f"Creating (Chain) Delivery with Pickups {pickup_stations} and Dropoffs {dropoff_stations}")
                 task = TaskObject(TaskType.DELIVERY_CHAINED, pick_up_places=pickup_stations, drop_off_places=dropoff_stations, item_ids_pickup=item_ids_pickup, item_ids_dropoff=item_ids_dropoff)
 
         # Dispatch the task
@@ -417,28 +462,24 @@ class AmrTaskAtomizer(Node):
 
     def wait_for_api_response(self):
         if not self.task_dispatched_event.is_set():
-            self.get_logger().info(f"Waiting for answer for task {self.dispatched_request_id}")
+            self.get_logger().debug(f"Waiting for answer for task {self.dispatched_request_id}")
             self.task_dispatched_event.wait()
-            self.get_logger().info("Got answer!")
+            self.get_logger().debug("Got answer!")
         else:
-            self.get_logger().info("Already got an answer!")
+            self.get_logger().debug("Already got an answer!")
 
         self.task_dispatched_event.clear()
 
     def task_response_cb(self, response_msg: ApiResponse):
-        self.get_logger().info(f"Got called for response id {response_msg.request_id}")
-        self.get_logger().info(f"Excpected id {self.dispatched_request_id}")
+        self.get_logger().debug(f"Got called for response id {response_msg.request_id}")
+        self.get_logger().debug(f"Excpected id {self.dispatched_request_id}")
         if self.dispatched_request_id == None:
             return
         if self.dispatched_request_id == response_msg.request_id:
-            self.get_logger().info("Should go ahead")
+            self.get_logger().debug("Should go ahead")
             response_data = json.loads(response_msg.json_msg)
             self.latest_rmf_id = response_data["state"]["booking"]["id"]
             self.task_dispatched_event.set()
-
-    def debug_function(self):
-        self.get_logger().info("Debugging")
-        self.add_robot("Robot_1")
 
 
 def main():
@@ -451,7 +492,6 @@ def main():
 
     # Run the executor
     try:
-        atomizer.debug_function()
         executor.spin()
     finally:
         executor.shutdown()

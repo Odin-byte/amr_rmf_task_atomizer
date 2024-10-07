@@ -34,6 +34,7 @@ class AmrTaskAtomizer(Node):
         self.task_dispatched_event = threading.Event()
         self.dispatched_request_id = None
         self.latest_rmf_id = None
+        self.dispatched_tasks = 0
 
 
         self.available_stations = {}
@@ -60,7 +61,7 @@ class AmrTaskAtomizer(Node):
         task_response_cb_group = MutuallyExclusiveCallbackGroup()
         self.create_subscription(ApiResponse, 'task_api_responses', self.task_response_cb, 10, callback_group=task_response_cb_group)
         self.create_timer(5.0, self.check_station_cb)
-        self.create_timer(5.0, self._publish_current_tasks)
+        self.create_timer(1.0, self._publish_current_tasks)
 
         self.declare_parameter(
             "config_path",
@@ -117,6 +118,8 @@ class AmrTaskAtomizer(Node):
 
         # Add a transport pair to the given stations
         pair_id = self.add_transport_pair(request.pickup_station, request.dropoff_station)
+        self.dispatched_tasks += 1
+        self.get_logger().info(f"Added tasks number {self.dispatched_tasks}")
 
         if pair_id == None:
             response.success = False
